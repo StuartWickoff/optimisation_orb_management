@@ -52,8 +52,9 @@ private:
 
     // ✅ SUPERTREND M1 - DÉTECTION DES PLATEAUX
     //-------------------------------------------
-    STRUCT_ST_HISTORY m_STPlateau;         // État du tracking
-    datetime          m_LastST_ReadTime;   // Anti-doublon M1
+    STRUCT_ST_HISTORY m_STPlateau;              // État du tracking
+    datetime          m_LastProcessedM1Bar;     // Anti-doublon : dernière bougie M1 traitée
+    ulong             m_STTrackedPositionTicket; // Ticket de la position suivie (anti-confusion)
 
     // ✅ VARIABLES POUR VERROUILLAGE JOURNALIER
     //-------------------------------------------
@@ -76,10 +77,11 @@ private:
     
     // ✅ SUPERTREND M1 - DÉTECTION DES PLATEAUX
     //-------------------------------------------
-    void     InitSTPlateauTracking(const ENUM_TREND i_expected_direction);
+    void     InitSTPlateauTracking(const ENUM_TREND i_expected_direction, const ulong i_position_ticket);
     void     UpdateSTPlateauDetection(const MqlTick &i_tick);
     void     ResetSTPlateauTracking(void);
     bool     TryMoveSLToPlateauLevel(void);
+    double   NormalizeToTickSize(const double i_price);
     
     bool     IsSessionValid(void);
     bool     IsPositionOpenedToday(const MqlTick &i_tick);
@@ -159,9 +161,10 @@ bool CStrategy::Config(const string            i_strategy_name,
     
     // ✅ SUPERTREND M1 INITIALIZATION
     //--------------------------------
-    m_LastST_ReadTime = 0;
+    m_LastProcessedM1Bar      = 0;
+    m_STTrackedPositionTicket = 0;
     ZeroMemory(m_STPlateau);
-    m_STPlateau.active = false;      
+    m_STPlateau.active        = false;      
 
     // Création des handles pour les indicateurs
 
@@ -609,11 +612,15 @@ void CStrategy::Detection(void)
 
 //+------------------------------------------------------------------+
 //| ManagePositions                                                  |
-//| Appelée à chaque tick depuis OnTick()                            |
-//| Gère dans l'ordre :                                              |
-//|  1. Zone NEWS  → annulation immédiate des ordres en attente      |
-//|  2. BreakEven  → déplacement du SL si ratio atteint              |
-//|  3. Divergence ST/EMA → annulation si conditions invalides       |
+//| Appelée à chaque tick depuis OnTick() et OnTimer().              |
+//| Ordre (spec §25) :                                                |
+//|  1. Lecture tick                                                  |
+//|  2. Zone NEWS → annuler pending orders (NE bloque PAS la gestion)|
+//|  3. Si position ouverte :                                         |
+//|       a. Sortie EMA M1 (prioritaire) → fermer + return           |
+//|       b. Protection SL par plateaux ST M1                         |
+//|  4. Zone NEWS → return (bloque nouvelles entrées)                 |
+//|  5. Divergence ST/EMA → annulation pending orders                 |
 //| INPUT:                                                           |
 //|  None                                                            |
 //| OUTPUT:                                                          |
@@ -635,46 +642,62 @@ void CStrategy::ManagePositions(void)
         LOG.WARNING("ManagePositions : Impossible de lire le tick", __FUNCTION__);
         return;
     }
-    
-    // 1. ZONE NEWS : Priorité absolue
-    //--------------------------------
-    if (!PARAM.OutsideSecurityZone())
+
+    // Flag zone NEWS (n'affecte QUE les nouvelles entrées)
+    //------------------------------------------------------
+    bool in_news_zone = !PARAM.OutsideSecurityZone();
+
+    // 1. ZONE NEWS : annuler les ordres en attente (mais ne pas bloquer la gestion)
+    //-------------------------------------------------------------------------------
+    if (in_news_zone)
     {
         if (HasPendingOrderForSymbol())
         {
-            LOG.INFO("🔴 Zone NEWS (tick) - Annulation immédiate des ordres", __FUNCTION__);
+            LOG.INFO("🔴 Zone NEWS (tick) - Annulation immédiate des ordres en attente", __FUNCTION__);
             DATAS.CancelPendingOrder();
         }
+    }
 
-        // ✅ Détection plateaux ST M1 même en zone NEWS pour protéger les positions
-        //----------------------------------------------------------------------
+    // 2. POSITION EXISTANTE : gestion prioritaire (même en zone NEWS)
+    //-----------------------------------------------------------------
+    if (HasPositionForSymbol())
+    {
+        // 2a. SORTIE EMA M1 — priorité absolue, reste active en zone NEWS
+        //----------------------------------------------------------------
+        if (CheckTrendExitOnM1())
+        {
+            // CheckTrendExitOnM1 a déjà loggé + fermé la position.
+            // NE PAS continuer à construire un plateau sur une position fermée.
+            return;
+        }
+
+        // 2b. PROTECTION SL PAR PLATEAUX ST M1 — reste active en zone NEWS
+        //-----------------------------------------------------------------
         if (l_Config.apply_be)
         {
             UpdateSTPlateauDetection(l_Tick);
         }
-        return;
     }
-
-    // 2. ✅ DÉTECTION PLATEAUX SUPERTREND M1
-    //---------------------------------------
-    if (l_Config.apply_be)
+    else
     {
-        UpdateSTPlateauDetection(l_Tick);
-    }
-
-    // 3. SORTIE PAR CHANGEMENT DE TENDANCE (EMA PRIORITAIRE)
-    //---------------------------------------------------------
-    if (HasPositionForSymbol())
-    {
-        if (CheckTrendExitOnM1())
+        // Pas de position ouverte → s'assurer que le tracking plateau est inactif
+        // (utile après une fermeture manuelle / TP serveur / etc.)
+        //------------------------------------------------------------------------
+        if (m_STPlateau.active)
         {
-            LOG.INFO("✅ Sortie déclenchée par EMA M1 / ST M1 - priorité EMA", __FUNCTION__);
-            return;
+            ResetSTPlateauTracking();
         }
     }
 
-    // 4. DIVERGENCE ST/EMA
-    //---------------------
+    // 3. ZONE NEWS : bloquer toute nouvelle entrée (return)
+    //-------------------------------------------------------
+    if (in_news_zone)
+    {
+        return;
+    }
+
+    // 4. DIVERGENCE ST/EMA (uniquement hors zone NEWS)
+    //--------------------------------------------------
     if (HasPendingOrderForSymbol())
     {
         if (!CheckSuperTrend(l_StTrend) || !CheckEMA(l_EmaTrend) || (l_StTrend != l_EmaTrend))
@@ -733,13 +756,15 @@ bool CStrategy::IsPositionOpenedToday(const MqlTick &i_tick)
 
         LOG.INFO("🔒 Position ouverte trouvée dans l'historique d'aujourd'hui", __FUNCTION__);
         m_PositionOpened = true;
-        
+
         // ✅ Initialiser le tracking des plateaux ST M1
+        // Le ticket du deal n'est pas un ticket de position ; on laissera
+        // UpdateSTPlateauTracking retrouver la position via Symbol()+Magic.
         //---------------------------------------------
         ENUM_DEAL_TYPE deal_type = (ENUM_DEAL_TYPE)HistoryDealGetInteger(l_Ticket, DEAL_TYPE);
         ENUM_TREND trend = (deal_type == DEAL_BUY) ? eT_Bull : eT_Bear;
-        InitSTPlateauTracking(trend);
-        
+        InitSTPlateauTracking(trend, 0);
+
         return(true);
     }
 
@@ -759,22 +784,25 @@ bool CStrategy::IsPositionOpenedToday(const MqlTick &i_tick)
         {
             LOG.INFO("🔒 Cassure OPR détectée — verrouillage journée (BUY)", __FUNCTION__);
             m_PositionOpened = true;
-            
+
             // ✅ Initialiser le tracking des plateaux ST M1
+            // La position n'est peut-être pas encore visible à ce tick exact :
+            // UpdateSTPlateauDetection s'assurera via HasPositionForSymbol() et
+            // fixera le ticket réel dès qu'elle sera disponible.
             //---------------------------------------------
-            InitSTPlateauTracking(eT_Bull);
-            
+            InitSTPlateauTracking(eT_Bull, 0);
+
             return(true);
         }
         if (type == ORDER_TYPE_SELL_STOP && i_tick.bid <= entry)
         {
             LOG.INFO("🔒 Cassure OPR détectée — verrouillage journée (SELL)", __FUNCTION__);
             m_PositionOpened = true;
-            
+
             // ✅ Initialiser le tracking des plateaux ST M1
             //---------------------------------------------
-            InitSTPlateauTracking(eT_Bear);
-            
+            InitSTPlateauTracking(eT_Bear, 0);
+
             return(true);
         }    
     }
@@ -790,13 +818,13 @@ bool CStrategy::IsPositionOpenedToday(const MqlTick &i_tick)
 
         LOG.INFO("🔒 Position détectée (ouverte actuellement)", __FUNCTION__);
         m_PositionOpened = true;
-        
-        // ✅ Initialiser le tracking des plateaux ST M1
-        //---------------------------------------------
+
+        // ✅ Initialiser le tracking des plateaux ST M1 avec le ticket réel
+        //-----------------------------------------------------------------
         ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
         ENUM_TREND trend = (pos_type == POSITION_TYPE_BUY) ? eT_Bull : eT_Bear;
-        InitSTPlateauTracking(trend);
-        
+        InitSTPlateauTracking(trend, l_Ticket);
+
         return(true);
     }
     
@@ -805,39 +833,44 @@ bool CStrategy::IsPositionOpenedToday(const MqlTick &i_tick)
 
 //+------------------------------------------------------------------+
 //| ✅ InitSTPlateauTracking                                         |
-//| Initialise le suivi des plateaux SuperTrend M1                   |
+//| Initialise le suivi des plateaux SuperTrend M1.                  |
+//| Ne reconstruit PAS d'historique de plateaux (spec §27).          |
 //| INPUT:                                                           |
 //|  i_expected_direction : Direction attendue (eT_Bull ou eT_Bear) |
+//|  i_position_ticket    : Ticket de la position (0 si pas encore    |
+//|                         visible — sera résolu au prochain tick)   |
 //| OUTPUT:                                                          |
 //|  None                                                            |
 //+------------------------------------------------------------------+
-void CStrategy::InitSTPlateauTracking(const ENUM_TREND i_expected_direction)
+void CStrategy::InitSTPlateauTracking(const ENUM_TREND i_expected_direction,
+                                     const ulong i_position_ticket)
 {
-    // Réinitialiser l'état du suivi
-    //------------------------------
+    // Réinitialiser l'état du suivi (ne pas réutiliser d'ancien état)
+    //----------------------------------------------------------------
     ZeroMemory(m_STPlateau);
-    
-    // Configuration
-    //--------------
-    m_STPlateau.expected_direction         = i_expected_direction;
-    m_STPlateau.active                     = true;
-    m_STPlateau.current_candidate.valid    = false;
-    m_STPlateau.current_candidate.level    = 0;
-    m_STPlateau.current_candidate.count    = 0;
-    m_STPlateau.last_confirmed.valid       = false;
-    m_STPlateau.previous_confirmed.valid   = false;
-    m_LastST_ReadTime                      = 0;
-    
-    // Log
-    //-----
+
+    m_STPlateau.expected_direction      = i_expected_direction;
+    m_STPlateau.active                  = true;
+    m_STPlateau.current_candidate.valid = false;
+    m_STPlateau.current_candidate.level = 0;
+    m_STPlateau.current_candidate.count = 0;
+    m_STPlateau.last_confirmed.valid    = false;
+
+    m_LastProcessedM1Bar      = 0;
+    m_STTrackedPositionTicket = i_position_ticket;
+
     string direction = (i_expected_direction == eT_Bull) ? "📈 LONG (UP)" : "📉 SHORT (DOWN)";
-    LOG.INFO("[ST PLATEAU] Suivi initialisé | Direction: " + direction, __FUNCTION__);
+    string ticket_s  = (i_position_ticket == 0) ? "<pending>" : IntegerToString(i_position_ticket);
+    LOG.INFO("[ST PLATEAU] Suivi initialisé | Direction: " + direction +
+             " | Ticket: " + ticket_s, __FUNCTION__);
 }
 
 //+------------------------------------------------------------------+
 //| ✅ UpdateSTPlateauDetection                                      |
-//| Met à jour la détection des plateaux SuperTrend M1               |
-//| Appelée à chaque tick si apply_be est actif                      |
+//| Met à jour la détection des plateaux SuperTrend M1.              |
+//| Une seule observation par bougie M1 clôturée (shift=1).          |
+//| Les directions opposées à expected_direction sont ignorées.       |
+//| Un retour sur last_confirmed.level est ignoré.                    |
 //| INPUT:                                                           |
 //|  i_tick : Le tick courant                                        |
 //| OUTPUT:                                                          |
@@ -845,124 +878,139 @@ void CStrategy::InitSTPlateauTracking(const ENUM_TREND i_expected_direction)
 //+------------------------------------------------------------------+
 void CStrategy::UpdateSTPlateauDetection(const MqlTick &i_tick)
 {
-    // Vérifier que le suivi est actif
-    //--------------------------------
+    // 1. Tracking actif ?
+    //--------------------
     if (!m_STPlateau.active) return;
-    
-    // Vérifier qu'il y a au moins une position ouverte
-    //--------------------------------------------------
-    if (PositionsTotal() == 0) 
+
+    // 2. Vérifier qu'il existe une position RÉELLE pour cet EA (spec §12, §13)
+    //    Ne JAMAIS utiliser PositionsTotal()==0 (global au compte).
+    //-------------------------------------------------------------------------
+    if (!HasPositionForSymbol())
     {
-        ResetSTPlateauTracking();
+        // Pas encore de position visible (ex: pending exécuté entre deux ticks).
+        // On NE détruit PAS l'état : m_PositionOpened est déjà true côté EA.
+        // Le tracking sera réinitialisé proprement par ManagePositions dès que
+        // HasPositionForSymbol() redevient faux en dehors de cette phase.
         return;
     }
-    
-    // Anti-doublon : éviter traiter plusieurs fois la même barre M1
-    //---------------------------------------------------------------
+
+    // 3. Anti-doublon : traiter une seule fois par bougie M1 (spec §3)
+    //-----------------------------------------------------------------
     datetime current_m1_time = iTime(Symbol(), PERIOD_M1, 0);
-    double   st_value_m1     = 0.0;
-    double   st_direction_m1 = 0.0;
-    
-    // Lire le SuperTrend M1 (buffer 0 = valeur, buffer 2 = direction)
-    //---------------------------------------------------------------
-    double buffer_value_temp[1];
-    double buffer_dir_temp[1];
-    
-    if (CopyBuffer(m_HandleST_M1, 0, 0, 1, buffer_value_temp) != 1) return;
-    st_value_m1 = buffer_value_temp[0];
-    
-    if (CopyBuffer(m_HandleST_M1, 2, 0, 1, buffer_dir_temp) != 1) return;
-    st_direction_m1 = buffer_dir_temp[0];
-    
-    // Ignorer les valeurs invalides (ST pas encore prêt)
-    //---------------------------------------------------
-    if (st_value_m1 <= 0) return;
-    if (st_direction_m1 == 0) return;  // Direction neutre
-    
-    // Ignorer les ticks qui ne matchent pas la direction attendue
-    //------------------------------------------------------------
-    ENUM_TREND st_detected_trend = (st_direction_m1 > 0.0) ? eT_Bull : eT_Bear;
-    if (st_detected_trend != m_STPlateau.expected_direction) 
+    if (current_m1_time == 0) return;
+    if (current_m1_time == m_LastProcessedM1Bar) return;
+    m_LastProcessedM1Bar = current_m1_time;
+
+    // 4. Lire la ST M1 sur la DERNIÈRE BOUGIE CLÔTURÉE (shift=1, spec §2)
+    //    Buffer 0 = valeur ST, buffer 2 = direction ST.
+    //-------------------------------------------------------------------
+    double buffer_value[1];
+    double buffer_dir[1];
+
+    if (CopyBuffer(m_HandleST_M, 0, 1, 1, buffer_value) != 1) return;
+    if (CopyBuffer(m_HandleST_M, 2, 1, 1, buffer_dir)    != 1) return;
+
+    double st_value_m1     = buffer_value[0];
+    double st_direction_m1 = buffer_dir[0];
+
+    // 5. Valeurs invalides : ST pas encore prête
+    //--------------------------------------------
+    if (st_value_m1 <= 0.0) return;
+    if (st_direction_m1 == 0.0) return;
+
+    // 6. Direction opposée → IGNORE complètement (spec §4)
+    //    Ne crée pas / ne reset pas / ne confirme pas / ne déplace pas le SL.
+    //------------------------------------------------------------------------
+    ENUM_TREND st_detected = (st_direction_m1 > 0.0) ? eT_Bull : eT_Bear;
+    if (st_detected != m_STPlateau.expected_direction)
     {
-        // C'est du bruit - ignorer
+        string exp_s = (m_STPlateau.expected_direction == eT_Bull) ? "Bull" : "Bear";
+        string det_s = (st_detected == eT_Bull) ? "Bull" : "Bear";
+        LOG.INFO("[ST PLATEAU] Direction opposée ignorée | Expected=" + exp_s +
+                 " Detected=" + det_s, __FUNCTION__);
         return;
     }
-    
-    // Anti-doublon : vérifier si c'est la même barre M1
-    //---------------------------------------------------
-    if (m_LastST_ReadTime == current_m1_time && m_STPlateau.current_candidate.last_st_value == st_value_m1)
-    {
-        // Même barre M1 déjà traitée - ignorer
-        return;
-    }
-    
-    m_LastST_ReadTime = current_m1_time;
-    m_STPlateau.current_candidate.last_st_value = st_value_m1;
-    
-    // Calculer E(ST) = partie entière = FLOOR(value)
-    //-----------------------------------------------
+
+    // 7. Calcul E(ST) = floor(valeur)
+    //--------------------------------
     int current_level = (int)MathFloor(st_value_m1);
-    
-    // Première détection ou changement de niveau?
-    //-------------------------------------------
-    if (m_STPlateau.current_candidate.level == 0)
+
+    // 8. Retour sur le dernier plateau confirmé → IGNORE (spec §8)
+    //-------------------------------------------------------------
+    if (m_STPlateau.last_confirmed.valid && current_level == m_STPlateau.last_confirmed.level)
     {
-        // Premier candidat
-        //---------------
+        LOG.INFO("[ST PLATEAU] Retour plateau confirmé ignoré | Level=" +
+                 IntegerToString(current_level), __FUNCTION__);
+        return;
+    }
+
+    // 9. Gestion du candidat
+    //------------------------
+    if (!m_STPlateau.current_candidate.valid && m_STPlateau.current_candidate.count == 0)
+    {
+        // 9a. Aucun candidat → en créer un nouveau (spec §9)
+        //---------------------------------------------------
         m_STPlateau.current_candidate.level      = current_level;
-        m_STPlateau.current_candidate.first_value = st_value_m1;
+        m_STPlateau.current_candidate.first_value = st_value_m1; // immuable (spec §10)
         m_STPlateau.current_candidate.count      = 1;
         m_STPlateau.current_candidate.valid      = false;
-        
-        LOG.INFO("[ST PLATEAU] Nouveau candidat | Level=" + IntegerToString(current_level) + 
+
+        LOG.INFO("[ST PLATEAU] Nouveau candidat | Level=" + IntegerToString(current_level) +
                  " FirstValue=" + DoubleToString(st_value_m1, _Digits), __FUNCTION__);
     }
     else if (current_level == m_STPlateau.current_candidate.level)
     {
-        // Même niveau - incrémenter le compteur
-        //-----------------------------------------
+        // 9b. Même niveau → incrémenter
+        //-------------------------------
         m_STPlateau.current_candidate.count++;
-        
-        LOG.INFO("[ST PLATEAU] Occurrence " + IntegerToString(m_STPlateau.current_candidate.count) + 
-                 " | Level=" + IntegerToString(current_level), __FUNCTION__);
-        
-        // Plateau confirmé?
-        //-----------------
+
+        LOG.INFO("[ST PLATEAU] Occurrence | Level=" + IntegerToString(current_level) +
+                 " Count=" + IntegerToString(m_STPlateau.current_candidate.count), __FUNCTION__);
+
+        // 9c. Confirmation ?
+        //-------------------
         if (m_STPlateau.current_candidate.count >= (int)I_ST_Plateau_MinCount)
         {
-            // ✅ PLATEAU CONFIRMÉ
-            //-------------------
             m_STPlateau.current_candidate.valid = true;
-            LOG.INFO("[ST PLATEAU] ✅ CONFIRMÉ | Level=" + IntegerToString(current_level) + 
-                     " Count=" + IntegerToString(m_STPlateau.current_candidate.count), __FUNCTION__);
-            
-            // Tenter de déplacer le SL au niveau du plateau confirmé précédent
-            //------------------------------------------------------------------
-            if (TryMoveSLToPlateauLevel())
+
+            LOG.INFO("[ST PLATEAU] ✅ Confirmé | Level=" + IntegerToString(current_level) +
+                     " Count=" + IntegerToString(m_STPlateau.current_candidate.count) +
+                     " FirstValue=" + DoubleToString(m_STPlateau.current_candidate.first_value, _Digits),
+                     __FUNCTION__);
+
+            // 9d. Déplacement du SL (spec §6, §7) :
+            //    - Premier plateau  : stocker dans last_confirmed, NE PAS bouger le SL.
+            //    - Plateau suivant  : SL = last_confirmed.first_value AVANT de remplacer.
+            if (!m_STPlateau.last_confirmed.valid)
             {
-                LOG.INFO("[ST PLATEAU] SL déplacé avec succès", __FUNCTION__);
+                // Premier plateau confirmé : pas de déplacement (spec §6)
+                LOG.INFO("[ST PLATEAU] Premier plateau confirmé, aucun déplacement SL | Level=" +
+                         IntegerToString(current_level), __FUNCTION__);
+
+                m_STPlateau.last_confirmed = m_STPlateau.current_candidate;
+                ZeroMemory(m_STPlateau.current_candidate);
             }
-            
-            // Rotation des plateaux
-            //---------------------
-            m_STPlateau.previous_confirmed = m_STPlateau.last_confirmed;
-            m_STPlateau.last_confirmed = m_STPlateau.current_candidate;
-            
-            // Réinitialiser le candidat courant
-            //----------------------------------
-            ZeroMemory(m_STPlateau.current_candidate);
-            m_STPlateau.current_candidate.valid = false;
-            m_STPlateau.current_candidate.level = 0;
-            m_STPlateau.current_candidate.count = 0;
+            else
+            {
+                // Plateau B (ou suivant) confirmé :
+                //   new_sl = last_confirmed.first_value  (= plateau A)
+                //   tenter la modif AVANT de remplacer last_confirmed (spec §7)
+                TryMoveSLToPlateauLevel();
+
+                m_STPlateau.last_confirmed = m_STPlateau.current_candidate;
+                ZeroMemory(m_STPlateau.current_candidate);
+            }
         }
     }
     else
     {
-        // Changement de niveau - réinitialiser avec le nouveau
-        //-------------------------------------------------------
-        LOG.INFO("[ST PLATEAU] Changement de niveau | OldLevel=" + IntegerToString(m_STPlateau.current_candidate.level) + 
-                 " NewLevel=" + IntegerToString(current_level), __FUNCTION__);
-        
+        // 9e. Changement de niveau : abandonner le candidat, en créer un nouveau (spec §9)
+        //--------------------------------------------------------------------------------
+        LOG.INFO("[ST PLATEAU] Changement de niveau | OldLevel=" +
+                 IntegerToString(m_STPlateau.current_candidate.level) +
+                 " OldCount=" + IntegerToString(m_STPlateau.current_candidate.count) +
+                 " → NewLevel=" + IntegerToString(current_level), __FUNCTION__);
+
         m_STPlateau.current_candidate.level       = current_level;
         m_STPlateau.current_candidate.first_value = st_value_m1;
         m_STPlateau.current_candidate.count       = 1;
@@ -985,16 +1033,37 @@ void CStrategy::ResetSTPlateauTracking(void)
     {
         LOG.INFO("[ST PLATEAU] Suivi réinitialisé", __FUNCTION__);
     }
-    
+
     ZeroMemory(m_STPlateau);
-    m_STPlateau.active = false;
-    m_LastST_ReadTime = 0;
+    m_STPlateau.active            = false;
+    m_LastProcessedM1Bar          = 0;
+    m_STTrackedPositionTicket     = 0;
+}
+
+//+------------------------------------------------------------------+
+//| ✅ NormalizeToTickSize                                            |
+//| Aligne un prix sur le tick size du symbole (spec §18).           |
+//| INPUT:                                                           |
+//|  i_price : prix brut                                             |
+//| OUTPUT:                                                          |
+//|  prix aligné au tick size, puis normalisé à _Digits              |
+//+------------------------------------------------------------------+
+double CStrategy::NormalizeToTickSize(const double i_price)
+{
+    double tick_size = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE);
+    if (tick_size <= 0.0) return(NormalizeDouble(i_price, _Digits));
+    double aligned = MathRound(i_price / tick_size) * tick_size;
+    return(NormalizeDouble(aligned, _Digits));
 }
 
 //+------------------------------------------------------------------+
 //| ✅ TryMoveSLToPlateauLevel                                       |
-//| Essaie de déplacer le SL vers le niveau du plateau précédent     |
-//| (previous_confirmed.first_value)                                 |
+//| Tente de déplacer le SL vers last_confirmed.first_value.         |
+//| Garde-fous :                                                     |
+//|  - SL ne recule jamais (spec §11)                                |
+//|  - respecte SYMBOL_TRADE_STOPS_LEVEL et SYMBOL_TRADE_FREEZE_LEVEL|
+//|  - aligne au SYMBOL_TRADE_TICK_SIZE (spec §18)                   |
+//|  - conserve le TP existant, n'impose pas ORDER_FILLING_FOK       |
 //| INPUT:                                                           |
 //|  None                                                            |
 //| OUTPUT:                                                          |
@@ -1002,110 +1071,184 @@ void CStrategy::ResetSTPlateauTracking(void)
 //+------------------------------------------------------------------+
 bool CStrategy::TryMoveSLToPlateauLevel(void)
 {
-    // Vérifier qu'il y a un plateau précédent confirmé
-    //--------------------------------------------------
-    if (!m_STPlateau.previous_confirmed.valid)
+    // 1. last_confirmed doit être valide (c'est la cible)
+    //-----------------------------------------------------
+    if (!m_STPlateau.last_confirmed.valid)
     {
-        LOG.WARNING("[ST PLATEAU] Pas de plateau précédent pour déplacer le SL", __FUNCTION__);
+        // Premier plateau : pas encore de cible — c'est normal (spec §6).
         return(false);
     }
-    
-    // Récupérer la position ouverte
-    //------------------------------
-    ulong ticket = 0;
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
+
+    // 2. Sélectionner la position suivie (ticket si connu, sinon via Symbol+Magic)
+    //-----------------------------------------------------------------------------
+    ulong ticket = m_STTrackedPositionTicket;
+    if (ticket == 0 || !PositionSelectByTicket(ticket))
     {
-        ulong pos_ticket = PositionGetTicket(i);
-        if (PositionGetString(POSITION_SYMBOL)  == Symbol() && 
-            PositionGetInteger(POSITION_MAGIC)  == (K_Magic + I_Robot_ID))
+        ticket = 0;
+        for (int i = PositionsTotal() - 1; i >= 0; i--)
         {
-            ticket = pos_ticket;
-            break;
+            ulong pos_ticket = PositionGetTicket(i);
+            if (PositionGetString(POSITION_SYMBOL)  == Symbol() &&
+                PositionGetInteger(POSITION_MAGIC)  == (K_Magic + I_Robot_ID))
+            {
+                ticket = pos_ticket;
+                break;
+            }
         }
+        if (ticket == 0 || !PositionSelectByTicket(ticket))
+        {
+            LOG.WARNING("[ST PLATEAU] Position non trouvée pour déplacement SL", __FUNCTION__);
+            return(false);
+        }
+        m_STTrackedPositionTicket = ticket;
     }
-    
-    if (ticket == 0)
-    {
-        LOG.WARNING("[ST PLATEAU] Position non trouvée", __FUNCTION__);
-        return(false);
-    }
-    
-    // Récupérer les paramètres de la position
-    //----------------------------------------
-    if (!PositionSelectByTicket(ticket))
-    {
-        LOG.WARNING("[ST PLATEAU] Impossible de sélectionner la position", __FUNCTION__);
-        return(false);
-    }
-    
-    double current_sl = PositionGetDouble(POSITION_SL);
-    ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-    double new_sl = m_STPlateau.previous_confirmed.first_value;
-    int digits = (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
-    
-    // Normaliser les prix
-    //-------------------
-    current_sl = NormalizeDouble(current_sl, digits);
-    new_sl = NormalizeDouble(new_sl, digits);
-    
-    // Vérifier que le nouveau SL est plus favorable que l'actuel
-    //-----------------------------------------------------------
+
+    // 3. Données de la position
+    //--------------------------
+    double               current_sl = PositionGetDouble(POSITION_SL);
+    double               current_tp = PositionGetDouble(POSITION_TP);
+    ENUM_POSITION_TYPE   pos_type   = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double               new_sl     = m_STPlateau.last_confirmed.first_value;
+
+    int    prev_level       = m_STPlateau.last_confirmed.level;
+    double prev_first_value = m_STPlateau.last_confirmed.first_value;
+
+    // 4. Aligner au tick size puis normaliser (spec §18)
+    //----------------------------------------------------
+    new_sl     = NormalizeToTickSize(new_sl);
+    current_sl = NormalizeDouble(current_sl, _Digits);
+
+    // 5. Garde-fou "SL ne recule jamais" (spec §11)
+    //----------------------------------------------
     if (pos_type == POSITION_TYPE_BUY)
     {
-        // Pour un BUY : nouveau SL doit être plus haut (plus favorable)
         if (new_sl <= current_sl)
         {
-            LOG.INFO("[ST PLATEAU] Nouveau SL non favorable pour BUY | Current=" + 
-                     DoubleToString(current_sl, _Digits) + " New=" + DoubleToString(new_sl, _Digits), __FUNCTION__);
+            LOG.INFO("[ST PLATEAU] SL refusé car non favorable (BUY) | OldSL=" +
+                     DoubleToString(current_sl, _Digits) + " NewSL=" +
+                     DoubleToString(new_sl, _Digits), __FUNCTION__);
             return(false);
         }
     }
     else if (pos_type == POSITION_TYPE_SELL)
     {
-        // Pour un SELL : nouveau SL doit être plus bas (plus favorable)
         if (new_sl >= current_sl)
         {
-            LOG.INFO("[ST PLATEAU] Nouveau SL non favorable pour SELL | Current=" + 
-                     DoubleToString(current_sl, _Digits) + " New=" + DoubleToString(new_sl, _Digits), __FUNCTION__);
+            LOG.INFO("[ST PLATEAU] SL refusé car non favorable (SELL) | OldSL=" +
+                     DoubleToString(current_sl, _Digits) + " NewSL=" +
+                     DoubleToString(new_sl, _Digits), __FUNCTION__);
             return(false);
         }
     }
-    
-    // Construire la requête de modification
-    //--------------------------------------
-    MqlTradeRequest request;
-    MqlTradeResult result;
-    ZeroMemory(request);
-    ZeroMemory(result);
-    
-    request.action = TRADE_ACTION_SLTP;
-    request.symbol = Symbol();
-    request.sl = new_sl;
-    request.tp = PositionGetDouble(POSITION_TP);
-    request.position = ticket;
-    request.type_filling = ORDER_FILLING_FOK;
-    
-    // Envoyer la requête
-    //------------------
-    if (!OrderSend(request, result))
-    {
-        LOG.WARNING("[ST PLATEAU] Erreur OrderSend | Code=" + IntegerToString(result.retcode) + 
-                    " Message=" + result.comment, __FUNCTION__);
-        return(false);
-    }
-    
-    if (result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED)
-    {
-        LOG.INFO("[ST PLATEAU] ✅ SL déplacé | Ancien=" + DoubleToString(current_sl, _Digits) + 
-                 " Nouveau=" + DoubleToString(new_sl, _Digits) + " Level=" + 
-                 IntegerToString(m_STPlateau.previous_confirmed.level), __FUNCTION__);
-        return(true);
-    }
     else
     {
-        LOG.WARNING("[ST PLATEAU] OrderSend rejetée | Retcode=" + IntegerToString(result.retcode), __FUNCTION__);
         return(false);
     }
+
+    // 6. Contraintes broker (spec §17) — distance minimale
+    //------------------------------------------------------
+    MqlTick tick;
+    if (!SymbolInfoTick(Symbol(), tick))
+    {
+        LOG.WARNING("[ST PLATEAU] SymbolInfoTick échec — déplacement SL annulé", __FUNCTION__);
+        return(false);
+    }
+
+    double stop_level_points   = (double)SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL);
+    double freeze_level_points = (double)SymbolInfoInteger(Symbol(), SYMBOL_TRADE_FREEZE_LEVEL);
+    double required_distance   = MathMax(stop_level_points, freeze_level_points) * _Point;
+
+    bool   broker_ok = true;
+    string reject_reason = "";
+
+    if (pos_type == POSITION_TYPE_BUY)
+    {
+        // SL < Bid et Bid - new_sl >= required_distance
+        if (new_sl >= tick.bid)
+        {
+            broker_ok     = false;
+            reject_reason = "NewSL >= Bid";
+        }
+        else if ((tick.bid - new_sl) < required_distance)
+        {
+            broker_ok     = false;
+            reject_reason = "Bid-NewSL < required_distance";
+        }
+    }
+    else // SELL
+    {
+        // SL > Ask et new_sl - Ask >= required_distance
+        if (new_sl <= tick.ask)
+        {
+            broker_ok     = false;
+            reject_reason = "NewSL <= Ask";
+        }
+        else if ((new_sl - tick.ask) < required_distance)
+        {
+            broker_ok     = false;
+            reject_reason = "NewSL-Ask < required_distance";
+        }
+    }
+
+    if (!broker_ok)
+    {
+        LOG.WARNING("[ST PLATEAU] SL refusé broker | " + reject_reason +
+                    " | StopsLevel=" + DoubleToString(stop_level_points, 0) +
+                    "pts FreezeLevel=" + DoubleToString(freeze_level_points, 0) +
+                    "pts | Bid=" + DoubleToString(tick.bid, _Digits) +
+                    " Ask=" + DoubleToString(tick.ask, _Digits) +
+                    " NewSL=" + DoubleToString(new_sl, _Digits), __FUNCTION__);
+        return(false);
+    }
+
+    // 7. Requête TRADE_ACTION_SLTP minimale (spec §19) — pas de type_filling
+    //------------------------------------------------------------------------
+    MqlTradeRequest request;
+    MqlTradeResult  result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+
+    request.action   = TRADE_ACTION_SLTP;
+    request.symbol   = Symbol();
+    request.position = ticket;
+    request.sl       = new_sl;
+    request.tp       = current_tp; // conserver le TP existant (TP reste à 0)
+
+    LOG.INFO("[ST PLATEAU] SL demandé | Ticket=" + IntegerToString(ticket) +
+             " OldSL=" + DoubleToString(current_sl, _Digits) +
+             " NewSL=" + DoubleToString(new_sl, _Digits) +
+             " PreviousPlateauLevel=" + IntegerToString(prev_level) +
+             " PreviousPlateauFirstValue=" + DoubleToString(prev_first_value, _Digits),
+             __FUNCTION__);
+
+    if (!OrderSend(request, result))
+    {
+        LOG.WARNING("[ST PLATEAU] OrderSend échec | Retcode=" + IntegerToString(result.retcode) +
+                    " Comment=" + result.comment, __FUNCTION__);
+        return(false);
+    }
+
+    if (result.retcode == TRADE_RETCODE_DONE ||
+        result.retcode == TRADE_RETCODE_PLACED ||
+        result.retcode == TRADE_RETCODE_DONE_PARTIAL)
+    {
+        LOG.INFO("[ST PLATEAU] ✅ SL déplacé | Ticket=" + IntegerToString(ticket) +
+                 " OldSL=" + DoubleToString(current_sl, _Digits) +
+                 " NewSL=" + DoubleToString(new_sl, _Digits) +
+                 " Level=" + IntegerToString(prev_level) +
+                 " FirstValue=" + DoubleToString(prev_first_value, _Digits) +
+                 " Retcode=" + IntegerToString(result.retcode), __FUNCTION__);
+        return(true);
+    }
+
+    LOG.WARNING("[ST PLATEAU] SL refusé broker | Retcode=" + IntegerToString(result.retcode) +
+                " Comment=" + result.comment +
+                " StopsLevel=" + DoubleToString(stop_level_points, 0) + "pts" +
+                " FreezeLevel=" + DoubleToString(freeze_level_points, 0) + "pts" +
+                " Bid=" + DoubleToString(tick.bid, _Digits) +
+                " Ask=" + DoubleToString(tick.ask, _Digits) +
+                " NewSL=" + DoubleToString(new_sl, _Digits), __FUNCTION__);
+    return(false);
 }
 
 //+------------------------------------------------------------------+
@@ -1170,18 +1313,10 @@ bool CStrategy::CheckTrendExitOnM1(void)
 
         if (!ema_exit) continue;
 
-        if (st_flip)
-        {
-            LOG.INFO("⚠️ Changement de tendance confirmé par ST M1 + EMA M1 | Ticket=" +
-                     IntegerToString(l_Ticket) + " | EMA20=" + DoubleToString(ema20[0], _Digits) +
-                     " | EMA50=" + DoubleToString(ema50[0], _Digits), __FUNCTION__);
-        }
-        else
-        {
-            LOG.INFO("⚠️ EMA M1 décide la sortie (ST ne confirme pas) | Ticket=" +
-                     IntegerToString(l_Ticket) + " | EMA20=" + DoubleToString(ema20[0], _Digits) +
-                     " | EMA50=" + DoubleToString(ema50[0], _Digits), __FUNCTION__);
-        }
+        LOG.INFO("[Sortie EMA] Ticket=" + IntegerToString(l_Ticket) +
+                 " | EMA20=" + DoubleToString(ema20[0], _Digits) +
+                 " | EMA50=" + DoubleToString(ema50[0], _Digits) +
+                 (st_flip ? " | ST M1 confirme (flip)" : " | ST M1 ne confirme pas"), __FUNCTION__);
 
         if (ClosePositionByTicket(l_Ticket, pos_type))
         {
@@ -1418,7 +1553,7 @@ bool CStrategy::CheckSuperTrend(ENUM_TREND &i_trend)
 {
     double st_direction[];
 
-    if (CopyBuffer(m_HandleST, 2, 1, 1, st_direction) != 1)
+    if (CopyBuffer(m_HandleST_D, 2, 1, 1, st_direction) != 1)
     {
         LOG.WARNING(DATAS.GetStrategyName() + "SuperTrend indisponible", __FUNCTION__);
         return(false);
@@ -1445,12 +1580,12 @@ bool CStrategy::CheckEMA(ENUM_TREND &i_trend)
     double ema20[];
     double ema50[];
 
-    if (CopyBuffer(m_HandleEMA20, 0, 1, 1, ema20) != 1)
+    if (CopyBuffer(m_HandleEMA20_M5, 0, 1, 1, ema20) != 1)
     {
         LOG.WARNING(DATAS.GetStrategyName() + "EMA20 indisponible", __FUNCTION__);
         return(false);
     }    
-    if (CopyBuffer(m_HandleEMA50, 0, 1, 1, ema50) != 1)
+    if (CopyBuffer(m_HandleEMA50_M5, 0, 1, 1, ema50) != 1)
     {
         LOG.WARNING(DATAS.GetStrategyName() + "EMA50 indisponible", __FUNCTION__);
         return(false);
