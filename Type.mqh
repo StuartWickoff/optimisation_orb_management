@@ -156,15 +156,16 @@ struct STRUCT_STRATEGY
 };
 
 // ✅ STRUCTURE POUR DÉTECTION DES PLATEAUX SUPERTREND M1
-//------------------------------------------------------
+// Anti-doublon : géré uniquement par m_LastProcessedM1Bar au niveau CStrategy
+// (une seule observation par bougie M1 clôturée, lue en shift=1).
+// Les champs last_st_value / last_read_time ont été retirés (code mort).
+//----------------------------------------------------------------------
 struct STRUCT_ST_PLATEAU
 {
    bool     valid;              // Plateau confirmé?
-   int      level;              // E(ST) = partie entière de la valeur
-   double   first_value;        // Première valeur réelle du plateau
-   int      count;              // Nombre d'occurrences du niveau
-   double   last_st_value;      // Dernière valeur ST lue (anti-doublon)
-   datetime last_read_time;     // Timestamp du dernier shift (anti-doublon M1)
+   int      level;              // E(ST) = partie entière de la valeur ST
+   double   first_value;        // Première valeur réelle observée (immuable pendant la vie du candidat)
+   int      count;              // Nombre d'occurrences (1 par bougie M1 clôturée)
 };
 
 // ✅ STRUCTURE POUR HISTORIQUE DES PLATEAUX
@@ -172,9 +173,8 @@ struct STRUCT_ST_PLATEAU
 struct STRUCT_ST_HISTORY
 {
    STRUCT_ST_PLATEAU current_candidate;     // Candidat en construction
-   STRUCT_ST_PLATEAU last_confirmed;        // Dernier plateau confirmé
-   STRUCT_ST_PLATEAU previous_confirmed;    // Avant-dernier plateau confirmé
-   ENUM_TREND        expected_direction;    // Direction attendue (UP pour BUY, DOWN pour SELL)
-   bool              active;                 // Tracking en cours?
+   STRUCT_ST_PLATEAU last_confirmed;        // Dernier plateau confirmé (cible pour le déplacement SL)
+   ENUM_TREND        expected_direction;    // Direction attendue (eT_Bull pour BUY, eT_Bear pour SELL)
+   bool              active;                // Tracking en cours?
 };
 

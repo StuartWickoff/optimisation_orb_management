@@ -271,12 +271,11 @@ void OnTimer()
    //-----------------------------------------------
    RegularTreatments();
 
-   // ✅ Annulation des ordres même sans tick (marché gelé pendant news)
-   //-------------------------------------------------------------------
-   if (MONITORING.ReadyForStrategy())
-   {
-       STRAT.ManagePositions();
-   }
+   // ✅ ManagePositions toujours appelé : la zone NEWS est gérée EN INTERNAL
+   // (annulation pending + gestion position existante + protection SL plateau).
+   // ReadyForStrategy ne filtre QUE les nouvelles entrées (Detection).
+   //------------------------------------------------------------------------
+   STRAT.ManagePositions();
 }
 
 ////////////////////////////////////////////////////////////////////
@@ -294,17 +293,19 @@ void OnTick()
    //-----------------------------------------------
    RegularTreatments();
 
-   // Traite la stratégie si les contextes sont bons
-   //-----------------------------------------------
-   if (!MONITORING.ReadyForStrategy()) return;
-   
-   // ✅ GESTION DES POSITIONS À CHAQUE TICK (BE, Trailing Stop, etc.)
-   //------------------------------------------------------------------
-
+   // ✅ ManagePositions toujours appelé (même en zone NEWS) :
+   //    - annulation pending orders en zone NEWS
+   //    - sortie EMA M1 reste active
+   //    - protection SL par plateaux ST M1 reste active
+   // La zone NEWS ne bloque QUE les nouvelles entrées (Detection ci-dessous).
+   //-------------------------------------------------------------------------
    STRAT.ManagePositions();
 
-   // Analyse si une détection est nouvelle pour la stratégie
-   //-------------------------------------------------------
+   // Traite la détection de nouvelles opportunités uniquement si tous les
+   // contextes (technique, finance, horaire, hors news) sont réunis.
+   //--------------------------------------------------------------------
+   if (!MONITORING.ReadyForStrategy()) return;
+
    if (CONTEXT.NewCandle())
    {
       STRAT.Detection();
