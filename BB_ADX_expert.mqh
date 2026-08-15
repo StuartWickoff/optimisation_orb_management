@@ -99,6 +99,17 @@ input double              K_MinRange_ATR_Ratio   = 0.5;          // Range min = 
 input ENUM_APPLIED_PRICE  K_ST_Source            = PRICE_MEDIAN;
 input uint                I_ST_Plateau_MinCount  = 3;            // n = Nombre minimum d'occurrences pour confirmer plateau
 input double              K_Max_Risk_Auth        = 2.5;          // Risque max autorisé pour fallback MinLot (%)
+
+// Mode de gestion du Stop Loss après l'entrée ORB.
+//   SL_MODE_R_BE       : ancien mode BreakEven par ratio R (ApplyBreakEven)
+//   SL_MODE_ST_PLATEAU : nouveau mode protection par plateaux SuperTrend M1
+// Les deux modes NE doivent JAMAIS tourner simultanément sur la même position.
+enum ENUM_SL_MANAGEMENT_MODE
+{
+   SL_MODE_R_BE        = 0,   // BreakEven par ratio R (ancien)
+   SL_MODE_ST_PLATEAU  = 1,   // Plateaux SuperTrend M1 (nouveau)
+};
+input ENUM_SL_MANAGEMENT_MODE I_SL_Management_Mode = SL_MODE_ST_PLATEAU; // Mode de gestion du SL post-entrée
  
 
 //============================================

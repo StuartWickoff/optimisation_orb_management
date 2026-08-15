@@ -52,9 +52,18 @@ private:
 
     // ✅ SUPERTREND M1 - DÉTECTION DES PLATEAUX
     //-------------------------------------------
-    STRUCT_ST_HISTORY m_STPlateau;              // État du tracking
-    datetime          m_LastProcessedM1Bar;     // Anti-doublon : dernière bougie M1 traitée
+    STRUCT_ST_HISTORY m_STPlateau;               // État du tracking structurel (1 obs / M1)
+    datetime          m_LastProcessedM1Bar;      // Anti-doublon : dernière bougie M1 traitée
     ulong             m_STTrackedPositionTicket; // Ticket de la position suivie (anti-confusion)
+
+    // ✅ PENDING SL — exécution indépendante de la détection (CORR2, CORR13)
+    // Une modif de SL décidée à un plateau peut être retentée à chaque tick
+    // tant qu'elle n'a pas abouti, sans recalculer la structure.
+    //----------------------------------------------------------------------
+    bool              m_PendingSLMove;           // Une modif de SL est-elle en attente ?
+    double            m_PendingSL;               // Prix cible du SL en attente
+    int               m_PendingSLLevel;          // Niveau entier du plateau cible (log)
+    double            m_PendingSLFirstValue;     // first_value du plateau cible (log)
 
     // ✅ VARIABLES POUR VERROUILLAGE JOURNALIER
     //-------------------------------------------
@@ -80,8 +89,21 @@ private:
     void     InitSTPlateauTracking(const ENUM_TREND i_expected_direction, const ulong i_position_ticket);
     void     UpdateSTPlateauDetection(const MqlTick &i_tick);
     void     ResetSTPlateauTracking(void);
-    bool     TryMoveSLToPlateauLevel(void);
+    bool     TryMoveSLToPlateauLevel(const double i_target_sl,
+                                     const int    i_target_level,
+                                     const double i_target_first_val);
     double   NormalizeToTickSize(const double i_price);
+
+    // ✅ PENDING SL — exécution indépendante de la détection (CORR2, CORR13)
+    //----------------------------------------------------------------------
+    void     RetryPendingSLMove(void);
+    void     ClearPendingSLMove(void);
+
+    // ✅ POSITION LIFECYCLE — ticket-based reset (CORR3, CORR4)
+    //----------------------------------------------------------
+    bool     IsOurPositionTicket(const ulong i_ticket);
+    ulong    FindOurPositionTicket(void);
+    void     EnsureTrackingMatchesPosition(void);
     
     bool     IsSessionValid(void);
     bool     IsPositionOpenedToday(const MqlTick &i_tick);
@@ -163,6 +185,10 @@ bool CStrategy::Config(const string            i_strategy_name,
     //--------------------------------
     m_LastProcessedM1Bar      = 0;
     m_STTrackedPositionTicket = 0;
+    m_PendingSLMove           = false;
+    m_PendingSL               = 0.0;
+    m_PendingSLLevel          = 0;
+    m_PendingSLFirstValue     = 0.0;
     ZeroMemory(m_STPlateau);
     m_STPlateau.active        = false;      
 
@@ -663,6 +689,7 @@ void CStrategy::ManagePositions(void)
     if (HasPositionForSymbol())
     {
         // 2a. SORTIE EMA M1 — priorité absolue, reste active en zone NEWS
+        //     La ST n'est PAS une condition de sortie directionnelle.
         //----------------------------------------------------------------
         if (CheckTrendExitOnM1())
         {
@@ -671,17 +698,35 @@ void CStrategy::ManagePositions(void)
             return;
         }
 
-        // 2b. PROTECTION SL PAR PLATEAUX ST M1 — reste active en zone NEWS
-        //-----------------------------------------------------------------
-        if (l_Config.apply_be)
+        // 2b. Gestion du SL post-entrée : un seul mode actif à la fois (CORR1).
+        //     - SL_MODE_R_BE       : ApplyBreakEven() (ancien)
+        //     - SL_MODE_ST_PLATEAU : UpdateSTPlateauDetection() (nouveau)
+        //     Les deux NE doivent JAMAIS tourner simultanément.
+        //----------------------------------------------------------------------
+        if (I_SL_Management_Mode == SL_MODE_R_BE)
         {
+            if (l_Config.apply_be)
+            {
+                ApplyBreakEven(l_Tick);
+            }
+        }
+        else // SL_MODE_ST_PLATEAU
+        {
+            // Détection structurelle : UNE observation par bougie M1 clôturée.
             UpdateSTPlateauDetection(l_Tick);
+
+            // Exécution d'une modif SL déjà décidée : retentée à CHAQUE tick
+            // indépendamment de la détection M1 (CORR2, CORR13, CORR14).
+            if (m_PendingSLMove)
+            {
+                RetryPendingSLMove();
+            }
         }
     }
     else
     {
         // Pas de position ouverte → s'assurer que le tracking plateau est inactif
-        // (utile après une fermeture manuelle / TP serveur / etc.)
+        // (utile après une fermeture manuelle / TP serveur / etc.) (CORR4)
         //------------------------------------------------------------------------
         if (m_STPlateau.active)
         {
@@ -861,8 +906,10 @@ void CStrategy::InitSTPlateauTracking(const ENUM_TREND i_expected_direction,
 
     string direction = (i_expected_direction == eT_Bull) ? "📈 LONG (UP)" : "📉 SHORT (DOWN)";
     string ticket_s  = (i_position_ticket == 0) ? "<pending>" : IntegerToString(i_position_ticket);
-    LOG.INFO("[ST PLATEAU] Suivi initialisé | Direction: " + direction +
+    LOG.INFO("[ST PLATEAU] INIT | Direction: " + direction +
              " | Ticket: " + ticket_s, __FUNCTION__);
+    LOG.INFO("[ST PLATEAU] Tracking démarré sans historique précédent", __FUNCTION__);
+    ClearPendingSLMove();
 }
 
 //+------------------------------------------------------------------+
@@ -882,17 +929,13 @@ void CStrategy::UpdateSTPlateauDetection(const MqlTick &i_tick)
     //--------------------
     if (!m_STPlateau.active) return;
 
-    // 2. Vérifier qu'il existe une position RÉELLE pour cet EA (spec §12, §13)
-    //    Ne JAMAIS utiliser PositionsTotal()==0 (global au compte).
+    // 2. Garantie d'identité de la position suivie (CORR3).
+    //    Si le ticket suivi ne correspond plus à une position réelle de cet EA
+    //    (fermeture + réouverture rapide, ou redémarrage), on s'aligne sur la
+    //    position courante. ManagePositions garantit qu'il existe au moins une
+    //    position pour ce symbole+magic.
     //-------------------------------------------------------------------------
-    if (!HasPositionForSymbol())
-    {
-        // Pas encore de position visible (ex: pending exécuté entre deux ticks).
-        // On NE détruit PAS l'état : m_PositionOpened est déjà true côté EA.
-        // Le tracking sera réinitialisé proprement par ManagePositions dès que
-        // HasPositionForSymbol() redevient faux en dehors de cette phase.
-        return;
-    }
+    EnsureTrackingMatchesPosition();
 
     // 3. Anti-doublon : traiter une seule fois par bougie M1 (spec §3)
     //-----------------------------------------------------------------
@@ -978,9 +1021,13 @@ void CStrategy::UpdateSTPlateauDetection(const MqlTick &i_tick)
                      " FirstValue=" + DoubleToString(m_STPlateau.current_candidate.first_value, _Digits),
                      __FUNCTION__);
 
-            // 9d. Déplacement du SL (spec §6, §7) :
+            // 9d. Déplacement du SL (spec §6, §7, CORR2) :
             //    - Premier plateau  : stocker dans last_confirmed, NE PAS bouger le SL.
-            //    - Plateau suivant  : SL = last_confirmed.first_value AVANT de remplacer.
+            //    - Plateau suivant  : SL = last_confirmed.first_value (plateau PRÉCÉDENT).
+            //      On tente la modif UNE fois ici. En cas d'échec broker, on enregistre
+            //      une cible SL en attente (m_PendingSL*) qui sera retentée à chaque tick
+            //      par ManagePositions. Le plateau confirmé est TOUJOURS rotationné :
+            //      la structure et l'exécution sont deux états séparés.
             if (!m_STPlateau.last_confirmed.valid)
             {
                 // Premier plateau confirmé : pas de déplacement (spec §6)
@@ -992,13 +1039,33 @@ void CStrategy::UpdateSTPlateauDetection(const MqlTick &i_tick)
             }
             else
             {
-                // Plateau B (ou suivant) confirmé :
-                //   new_sl = last_confirmed.first_value  (= plateau A)
-                //   tenter la modif AVANT de remplacer last_confirmed (spec §7)
-                TryMoveSLToPlateauLevel();
+                // Plateau B (ou suivant) confirmé.
+                // Cible = last_confirmed.first_value (plateau A) — AVANT rotation.
+                double target_sl        = m_STPlateau.last_confirmed.first_value;
+                int    target_level     = m_STPlateau.last_confirmed.level;
+                double target_first_val = m_STPlateau.last_confirmed.first_value;
 
+                // TOUJOURS rotationner le plateau confirmé (CORR2 : la structure
+                // et l'exécution sont indépendantes).
                 m_STPlateau.last_confirmed = m_STPlateau.current_candidate;
                 ZeroMemory(m_STPlateau.current_candidate);
+
+                // Tenter immédiatement la modif. Sur échec, enregistrer une cible
+                // SL en attente — sera retentée à chaque tick par RetryPendingSLMove().
+                if (!TryMoveSLToPlateauLevel(target_sl, target_level, target_first_val))
+                {
+                    m_PendingSLMove       = true;
+                    m_PendingSL           = target_sl;
+                    m_PendingSLLevel      = target_level;
+                    m_PendingSLFirstValue = target_first_val;
+                    LOG.INFO("[ST PLATEAU] SL mis en attente (retry par tick) | Target=" +
+                             DoubleToString(target_sl, _Digits) +
+                             " Level=" + IntegerToString(target_level), __FUNCTION__);
+                }
+                else
+                {
+                    ClearPendingSLMove();
+                }
             }
         }
     }
@@ -1031,13 +1098,121 @@ void CStrategy::ResetSTPlateauTracking(void)
 {
     if (m_STPlateau.active)
     {
-        LOG.INFO("[ST PLATEAU] Suivi réinitialisé", __FUNCTION__);
+        LOG.INFO("[ST PLATEAU] Position reset | Ticket=" +
+                 IntegerToString(m_STTrackedPositionTicket), __FUNCTION__);
     }
 
     ZeroMemory(m_STPlateau);
     m_STPlateau.active            = false;
     m_LastProcessedM1Bar          = 0;
     m_STTrackedPositionTicket     = 0;
+
+    ClearPendingSLMove();
+}
+
+//+------------------------------------------------------------------+
+//| ✅ ClearPendingSLMove                                             |
+//| Remet à zéro l'état "modif SL en attente".                       |
+//+------------------------------------------------------------------+
+void CStrategy::ClearPendingSLMove(void)
+{
+    m_PendingSLMove       = false;
+    m_PendingSL           = 0.0;
+    m_PendingSLLevel      = 0;
+    m_PendingSLFirstValue = 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| ✅ IsOurPositionTicket                                            |
+//| Vérifie qu'un ticket correspond à une position réelle de cet EA. |
+//+------------------------------------------------------------------+
+bool CStrategy::IsOurPositionTicket(const ulong i_ticket)
+{
+    if (i_ticket == 0) return(false);
+    if (!PositionSelectByTicket(i_ticket)) return(false);
+    if (PositionGetString(POSITION_SYMBOL)  != Symbol())              return(false);
+    if (PositionGetInteger(POSITION_MAGIC)  != (K_Magic + I_Robot_ID)) return(false);
+    return(true);
+}
+
+//+------------------------------------------------------------------+
+//| ✅ FindOurPositionTicket                                          |
+//| Retourne le ticket de la première position de cet EA, 0 sinon.   |
+//+------------------------------------------------------------------+
+ulong CStrategy::FindOurPositionTicket(void)
+{
+    for (int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong pos_ticket = PositionGetTicket(i);
+        if (PositionGetString(POSITION_SYMBOL)  == Symbol() &&
+            PositionGetInteger(POSITION_MAGIC)  == (K_Magic + I_Robot_ID))
+        {
+            return(pos_ticket);
+        }
+    }
+    return(0);
+}
+
+//+------------------------------------------------------------------+
+//| ✅ EnsureTrackingMatchesPosition                                 |
+//| CORR3 / CORR4 :                                                   |
+//|  - Si le ticket suivi n'existe plus (position fermée) MAIS qu'une |
+//|    autre position du même EA est ouverte (réouverture rapide),    |
+//|    on RESET complètement le tracking et on repart sur la nouvelle |
+//|    position avec un état neuf.                                    |
+//|  - Si aucun ticket n'était suivi (initialisation post-pending),   |
+//|    on l'associe simplement à la position courante.                |
+//|  - Si le ticket suivi est toujours valide, on ne touche à rien.   |
+//+------------------------------------------------------------------+
+void CStrategy::EnsureTrackingMatchesPosition(void)
+{
+    // Cas nominal : ticket suivi toujours valide.
+    if (IsOurPositionTicket(m_STTrackedPositionTicket)) return;
+
+    // Le ticket suivi n'est plus valide. Y a-t-il une nouvelle position ?
+    ulong new_ticket = FindOurPositionTicket();
+    if (new_ticket == 0)
+    {
+        // Aucune position de cet EA — ManagePositions gérera le reset.
+        return;
+    }
+
+    // Une nouvelle position existe : RESET COMPLET puis ré-init neuve.
+    ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    ENUM_TREND trend = (pos_type == POSITION_TYPE_BUY) ? eT_Bull : eT_Bear;
+
+    LOG.INFO("[ST PLATEAU] Nouveau ticket détecté — reset complet du tracking | OldTicket=" +
+             IntegerToString(m_STTrackedPositionTicket) + " NewTicket=" +
+             IntegerToString(new_ticket), __FUNCTION__);
+
+    InitSTPlateauTracking(trend, new_ticket);
+}
+
+//+------------------------------------------------------------------+
+//| ✅ RetryPendingSLMove                                             |
+//| Retente à chaque tick une modif SL déjà décidée mais échouée.    |
+//| INDÉPENDANT de la détection M1 (CORR2, CORR13, CORR14).          |
+//+------------------------------------------------------------------+
+void CStrategy::RetryPendingSLMove(void)
+{
+    if (!m_PendingSLMove) return;
+
+    // La position doit toujours exister.
+    if (!IsOurPositionTicket(m_STTrackedPositionTicket))
+    {
+        // Position fermée entre-temps : abandon de la cible.
+        ClearPendingSLMove();
+        return;
+    }
+
+    LOG.INFO("[ST PLATEAU] SL retry | Target=" + DoubleToString(m_PendingSL, _Digits) +
+             " Level=" + IntegerToString(m_PendingSLLevel), __FUNCTION__);
+
+    if (TryMoveSLToPlateauLevel(m_PendingSL, m_PendingSLLevel, m_PendingSLFirstValue))
+    {
+        ClearPendingSLMove();
+    }
+    // Sinon : on garde la cible et on retentera au prochain tick.
 }
 
 //+------------------------------------------------------------------+
@@ -1058,26 +1233,26 @@ double CStrategy::NormalizeToTickSize(const double i_price)
 
 //+------------------------------------------------------------------+
 //| ✅ TryMoveSLToPlateauLevel                                       |
-//| Tente de déplacer le SL vers last_confirmed.first_value.         |
+//| Tente de déplacer le SL vers une cible explicite.                |
 //| Garde-fous :                                                     |
-//|  - SL ne recule jamais (spec §11)                                |
+//|  - SL ne recule jamais (spec §11, CORR11)                        |
 //|  - respecte SYMBOL_TRADE_STOPS_LEVEL et SYMBOL_TRADE_FREEZE_LEVEL|
-//|  - aligne au SYMBOL_TRADE_TICK_SIZE (spec §18)                   |
+//|  - aligne au SYMBOL_TRADE_TICK_SIZE (spec §18, CORR13)           |
 //|  - conserve le TP existant, n'impose pas ORDER_FILLING_FOK       |
 //| INPUT:                                                           |
-//|  None                                                            |
+//|  i_target_sl        : prix cible brut (first_value du plateau)    |
+//|  i_target_level     : niveau entier du plateau cible (log)        |
+//|  i_target_first_val : first_value du plateau cible (log)          |
 //| OUTPUT:                                                          |
 //|  true si le SL a été déplacé avec succès                         |
 //+------------------------------------------------------------------+
-bool CStrategy::TryMoveSLToPlateauLevel(void)
+bool CStrategy::TryMoveSLToPlateauLevel(const double i_target_sl,
+                                       const int    i_target_level,
+                                       const double i_target_first_val)
 {
-    // 1. last_confirmed doit être valide (c'est la cible)
-    //-----------------------------------------------------
-    if (!m_STPlateau.last_confirmed.valid)
-    {
-        // Premier plateau : pas encore de cible — c'est normal (spec §6).
-        return(false);
-    }
+    // 1. Cible explicite obligatoire
+    //--------------------------------
+    if (i_target_sl <= 0.0) return(false);
 
     // 2. Sélectionner la position suivie (ticket si connu, sinon via Symbol+Magic)
     //-----------------------------------------------------------------------------
@@ -1108,10 +1283,10 @@ bool CStrategy::TryMoveSLToPlateauLevel(void)
     double               current_sl = PositionGetDouble(POSITION_SL);
     double               current_tp = PositionGetDouble(POSITION_TP);
     ENUM_POSITION_TYPE   pos_type   = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-    double               new_sl     = m_STPlateau.last_confirmed.first_value;
+    double               new_sl     = i_target_sl;
 
-    int    prev_level       = m_STPlateau.last_confirmed.level;
-    double prev_first_value = m_STPlateau.last_confirmed.first_value;
+    int    prev_level       = i_target_level;
+    double prev_first_value = i_target_first_val;
 
     // 4. Aligner au tick size puis normaliser (spec §18)
     //----------------------------------------------------
