@@ -45,6 +45,7 @@
 //                                                      //
 //////////////////////////////////////////////////////////
 #include <BB_ADX_EXPERT/Type.mqh>
+#include <BB_ADX_EXPERT/DST.mqh>
 #include <BB_ADX_EXPERT/Tools.mqh>
 #include <BB_ADX_EXPERT/Log.mqh>
 #include <BB_ADX_EXPERT/Alert.mqh>
