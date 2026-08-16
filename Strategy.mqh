@@ -384,7 +384,7 @@ void CStrategy::Detection(void)
     //--------------------------------------
     if (!IsSessionValid())
     {
-        if (OrdersTotal() > 0)
+        if (HasPendingOrderForSymbol())
         {
             LOG.INFO("Session invalide - Annulation des ordres en attente", __FUNCTION__);
             DATAS.CancelPendingOrder();
@@ -420,7 +420,12 @@ void CStrategy::Detection(void)
             LOG.INFO("Clôture forcée des positions : OPR_Close", __FUNCTION__);
             DATAS.CloseOfPositions();            
         }
-        DATAS.CancelPendingOrder();
+        // Ne pas spammer CancelPendingOrder() si aucun ordre n'est en attente
+        // (ce bloc est appelé à chaque tick + chaque seconde par OnTimer).
+        if (HasPendingOrderForSymbol())
+        {
+            DATAS.CancelPendingOrder();
+        }
         return;
     }
 
@@ -464,7 +469,7 @@ void CStrategy::Detection(void)
     //--------------------------------------------------
     if (TimeCurrent() >= opr_end)
     {
-        if (OrdersTotal() > 0)
+        if (HasPendingOrderForSymbol())
         {
             LOG.INFO("OPR - End dépassé - Annulation ordres en attente", __FUNCTION__);
             DATAS.CancelPendingOrder();
