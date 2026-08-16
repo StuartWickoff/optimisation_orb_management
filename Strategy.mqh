@@ -65,13 +65,6 @@ private:
     int               m_PendingSLLevel;          // Niveau entier du plateau cible (log)
     double            m_PendingSLFirstValue;     // first_value du plateau cible (log)
 
-    // ✅ ANTI-DOUBLE-TENTATIVE (CORR3) : flag par tick.
-    //    Si UpdateSTPlateauDetection() a déjà tenté TryMoveSLToPlateauLevel()
-    //    sur ce tick, RetryPendingSLMove() ne fait rien — le retry commencera
-    //    au tick suivant. Remis à false en début de ManagePositions().
-    //----------------------------------------------------------------------
-    bool              m_SLAttemptedThisTick;
-
     // ✅ VARIABLES POUR VERROUILLAGE JOURNALIER
     //-------------------------------------------
     int             m_LockedDay;           // Jour verrouillé
@@ -105,8 +98,6 @@ private:
     //----------------------------------------------------------------------
     void     RetryPendingSLMove(void);
     void     ClearPendingSLMove(void);
-    bool     IsMoreFavorableSL(const double i_candidate, const double i_reference,
-                               const ENUM_POSITION_TYPE i_type);
 
     // ✅ POSITION LIFECYCLE — ticket-based reset (CORR3, CORR4)
     //----------------------------------------------------------
@@ -198,7 +189,6 @@ bool CStrategy::Config(const string            i_strategy_name,
     m_PendingSL               = 0.0;
     m_PendingSLLevel          = 0;
     m_PendingSLFirstValue     = 0.0;
-    m_SLAttemptedThisTick     = false;
     ZeroMemory(m_STPlateau);
     m_STPlateau.active        = false;      
 
@@ -722,19 +712,12 @@ void CStrategy::ManagePositions(void)
         }
         else // SL_MODE_ST_PLATEAU
         {
-            // CORR3 : un seul OrderSend SLTP par tick. Reset en début de tick.
-            m_SLAttemptedThisTick = false;
-
             // Détection structurelle : UNE observation par bougie M1 clôturée.
-            // Peut déclencher un TryMoveSLToPlateauLevel() immédiat — auquel cas
-            // m_SLAttemptedThisTick passe à true.
             UpdateSTPlateauDetection(l_Tick);
 
             // Exécution d'une modif SL déjà décidée : retentée à CHAQUE tick
             // indépendamment de la détection M1 (CORR2, CORR13, CORR14).
-            // CORR3 : ne PAS re-tenter sur le même tick si la détection vient
-            // déjà de le faire — le retry commence au tick suivant.
-            if (m_PendingSLMove && !m_SLAttemptedThisTick)
+            if (m_PendingSLMove)
             {
                 RetryPendingSLMove();
             }
@@ -954,19 +937,15 @@ void CStrategy::UpdateSTPlateauDetection(const MqlTick &i_tick)
     //-------------------------------------------------------------------------
     EnsureTrackingMatchesPosition();
 
-    // 3. Anti-doublon : traiter une seule fois par bougie M1 (spec §3, CORR1).
-    //    IMPORTANT : la bougie n'est marquée "traitée" qu'APRÈS validation
-    //    complète de CopyBuffer ET des valeurs ST. Si la donnée n'est pas
-    //    encore disponible, on sort SANS modifier m_LastProcessedM1Bar afin
-    //    de pouvoir retenter la même bougie au tick suivant.
-    //-------------------------------------------------------------------------
+    // 3. Anti-doublon : traiter une seule fois par bougie M1 (spec §3)
+    //-----------------------------------------------------------------
     datetime current_m1_time = iTime(Symbol(), PERIOD_M1, 0);
     if (current_m1_time == 0) return;
     if (current_m1_time == m_LastProcessedM1Bar) return;
+    m_LastProcessedM1Bar = current_m1_time;
 
     // 4. Lire la ST M1 sur la DERNIÈRE BOUGIE CLÔTURÉE (shift=1, spec §2)
     //    Buffer 0 = valeur ST, buffer 2 = direction ST.
-    //    Si CopyBuffer échoue, on sort SANS marquer la bougie comme traitée.
     //-------------------------------------------------------------------
     double buffer_value[1];
     double buffer_dir[1];
@@ -977,17 +956,12 @@ void CStrategy::UpdateSTPlateauDetection(const MqlTick &i_tick)
     double st_value_m1     = buffer_value[0];
     double st_direction_m1 = buffer_dir[0];
 
-    // 5. Valeurs invalides : ST pas encore prête.
-    //    On sort SANS marquer la bougie comme traitée (CORR1).
+    // 5. Valeurs invalides : ST pas encore prête
     //--------------------------------------------
     if (st_value_m1 <= 0.0) return;
     if (st_direction_m1 == 0.0) return;
 
-    // 6. Donnée validée : on marque la bougie comme traitée — définitivement.
-    //------------------------------------------------------------------------
-    m_LastProcessedM1Bar = current_m1_time;
-
-    // 7. Direction opposée → IGNORE complètement (spec §4)
+    // 6. Direction opposée → IGNORE complètement (spec §4)
     //    Ne crée pas / ne reset pas / ne confirme pas / ne déplace pas le SL.
     //------------------------------------------------------------------------
     ENUM_TREND st_detected = (st_direction_m1 > 0.0) ? eT_Bull : eT_Bear;
@@ -1000,11 +974,11 @@ void CStrategy::UpdateSTPlateauDetection(const MqlTick &i_tick)
         return;
     }
 
-    // 8. Calcul E(ST) = floor(valeur)
+    // 7. Calcul E(ST) = floor(valeur)
     //--------------------------------
     int current_level = (int)MathFloor(st_value_m1);
 
-    // 9. Retour sur le dernier plateau confirmé → IGNORE (spec §8)
+    // 8. Retour sur le dernier plateau confirmé → IGNORE (spec §8)
     //-------------------------------------------------------------
     if (m_STPlateau.last_confirmed.valid && current_level == m_STPlateau.last_confirmed.level)
     {
@@ -1013,11 +987,11 @@ void CStrategy::UpdateSTPlateauDetection(const MqlTick &i_tick)
         return;
     }
 
-    // 10. Gestion du candidat
-    //--------------------------
+    // 9. Gestion du candidat
+    //------------------------
     if (!m_STPlateau.current_candidate.valid && m_STPlateau.current_candidate.count == 0)
     {
-        // 10a. Aucun candidat → en créer un nouveau (spec §9)
+        // 9a. Aucun candidat → en créer un nouveau (spec §9)
         //---------------------------------------------------
         m_STPlateau.current_candidate.level      = current_level;
         m_STPlateau.current_candidate.first_value = st_value_m1; // immuable (spec §10)
@@ -1029,14 +1003,14 @@ void CStrategy::UpdateSTPlateauDetection(const MqlTick &i_tick)
     }
     else if (current_level == m_STPlateau.current_candidate.level)
     {
-        // 10b. Même niveau → incrémenter
+        // 9b. Même niveau → incrémenter
         //-------------------------------
         m_STPlateau.current_candidate.count++;
 
         LOG.INFO("[ST PLATEAU] Occurrence | Level=" + IntegerToString(current_level) +
                  " Count=" + IntegerToString(m_STPlateau.current_candidate.count), __FUNCTION__);
 
-        // 10c. Confirmation ?
+        // 9c. Confirmation ?
         //-------------------
         if (m_STPlateau.current_candidate.count >= (int)I_ST_Plateau_MinCount)
         {
@@ -1047,7 +1021,7 @@ void CStrategy::UpdateSTPlateauDetection(const MqlTick &i_tick)
                      " FirstValue=" + DoubleToString(m_STPlateau.current_candidate.first_value, _Digits),
                      __FUNCTION__);
 
-            // 10d. Déplacement du SL (spec §6, §7, CORR2) :
+            // 9d. Déplacement du SL (spec §6, §7, CORR2) :
             //    - Premier plateau  : stocker dans last_confirmed, NE PAS bouger le SL.
             //    - Plateau suivant  : SL = last_confirmed.first_value (plateau PRÉCÉDENT).
             //      On tente la modif UNE fois ici. En cas d'échec broker, on enregistre
@@ -1076,49 +1050,17 @@ void CStrategy::UpdateSTPlateauDetection(const MqlTick &i_tick)
                 m_STPlateau.last_confirmed = m_STPlateau.current_candidate;
                 ZeroMemory(m_STPlateau.current_candidate);
 
-                // CORR3 : on s'apprête à tenter une modif SL sur ce tick.
-                m_SLAttemptedThisTick = true;
-
                 // Tenter immédiatement la modif. Sur échec, enregistrer une cible
-                // SL en attente — sera retentée à chaque tick suivant par
-                // RetryPendingSLMove() (jamais sur le même tick que la tentative initiale).
+                // SL en attente — sera retentée à chaque tick par RetryPendingSLMove().
                 if (!TryMoveSLToPlateauLevel(target_sl, target_level, target_first_val))
                 {
-                    // CORR2 : ne JAMAIS dégrader une cible pending existante.
-                    // La cible pending représente une protection déjà identifiée
-                    // et refusée temporairement par le broker — elle ne doit pas
-                    // être remplacée par une cible moins favorable.
-                    bool store_pending = true;
-
-                    if (m_PendingSLMove)
-                    {
-                        // Récupérer le type de position pour la comparaison.
-                        ENUM_POSITION_TYPE pos_type = POSITION_TYPE_BUY;
-                        if (PositionSelectByTicket(m_STTrackedPositionTicket))
-                        {
-                            pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-                        }
-
-                        // Comparer avec le pending existant.
-                        if (!IsMoreFavorableSL(target_sl, m_PendingSL, pos_type))
-                        {
-                            store_pending = false;
-                            LOG.INFO("[ST PLATEAU] Cible pending conservée (plus favorable) | "
-                                     "Existing=" + DoubleToString(m_PendingSL, _Digits) +
-                                     " Rejected=" + DoubleToString(target_sl, _Digits), __FUNCTION__);
-                        }
-                    }
-
-                    if (store_pending)
-                    {
-                        m_PendingSLMove       = true;
-                        m_PendingSL           = target_sl;
-                        m_PendingSLLevel      = target_level;
-                        m_PendingSLFirstValue = target_first_val;
-                        LOG.INFO("[ST PLATEAU] SL mis en attente (retry par tick) | Target=" +
-                                 DoubleToString(target_sl, _Digits) +
-                                 " Level=" + IntegerToString(target_level), __FUNCTION__);
-                    }
+                    m_PendingSLMove       = true;
+                    m_PendingSL           = target_sl;
+                    m_PendingSLLevel      = target_level;
+                    m_PendingSLFirstValue = target_first_val;
+                    LOG.INFO("[ST PLATEAU] SL mis en attente (retry par tick) | Target=" +
+                             DoubleToString(target_sl, _Digits) +
+                             " Level=" + IntegerToString(target_level), __FUNCTION__);
                 }
                 else
                 {
@@ -1129,7 +1071,7 @@ void CStrategy::UpdateSTPlateauDetection(const MqlTick &i_tick)
     }
     else
     {
-        // 10e. Changement de niveau : abandonner le candidat, en créer un nouveau (spec §9)
+        // 9e. Changement de niveau : abandonner le candidat, en créer un nouveau (spec §9)
         //--------------------------------------------------------------------------------
         LOG.INFO("[ST PLATEAU] Changement de niveau | OldLevel=" +
                  IntegerToString(m_STPlateau.current_candidate.level) +
@@ -1178,28 +1120,6 @@ void CStrategy::ClearPendingSLMove(void)
     m_PendingSL           = 0.0;
     m_PendingSLLevel      = 0;
     m_PendingSLFirstValue = 0.0;
-}
-
-//+------------------------------------------------------------------+
-//| ✅ IsMoreFavorableSL                                              |
-//| Indique si `i_candidate` est un SL plus favorable que             |
-//| `i_reference` pour le type de position donné (CORR2).             |
-//|   BUY  : plus le SL est HAUT, plus c'est favorable.               |
-//|   SELL : plus le SL est BAS, plus c'est favorable.                 |
-//| Un SL égal n'est PAS plus favorable (on ne dégrade pas).          |
-//+------------------------------------------------------------------+
-bool CStrategy::IsMoreFavorableSL(const double i_candidate,
-                                  const double i_reference,
-                                  const ENUM_POSITION_TYPE i_type)
-{
-    if (i_type == POSITION_TYPE_BUY)
-    {
-        return(i_candidate > i_reference);
-    }
-    else // POSITION_TYPE_SELL
-    {
-        return(i_candidate < i_reference);
-    }
 }
 
 //+------------------------------------------------------------------+
